@@ -1,6 +1,7 @@
 transformers>=4.45
 accelerate
 torch
+torchvision
 geopandas>=0.14
 rasterio>=1.3
 shapely>=2.0
