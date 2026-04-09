@@ -1,8 +1,8 @@
 ---
 title: SAM3 BA
-emoji: null
+emoji: "\U0001F3D7"
 colorFrom: gray
-colorTo: emerald
+colorTo: green
 sdk: gradio
 sdk_version: 5.0
 app_file: app.py
