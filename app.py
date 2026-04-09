@@ -18,8 +18,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import torch
-from osgeo import gdal
+from affine import Affine
 from PIL import Image
+from pyproj import CRS
 from rasterio.features import shapes
 from rasterio.plot import show
 from shapely.geometry import shape
@@ -58,29 +59,85 @@ WORLD_EXT_MAP = {
 }
 
 
+def _parse_world_file(world_path: str) -> Affine:
+    """Parse a 6-line world file into a rasterio Affine transform.
+
+    World file format:
+      line 0: x pixel size (a)
+      line 1: rotation (d)
+      line 2: rotation (b)
+      line 3: y pixel size, negative (e)
+      line 4: x origin - upper left pixel center (c)
+      line 5: y origin - upper left pixel center (f)
+
+    Affine(a, b, c, d, e, f)
+    """
+    lines = Path(world_path).read_text().strip().splitlines()
+    if len(lines) < 6:
+        raise gr.Error(f"World file must have 6 lines, got {len(lines)}")
+    a = float(lines[0])  # x pixel size
+    d = float(lines[1])  # rotation
+    b = float(lines[2])  # rotation
+    e = float(lines[3])  # y pixel size (negative)
+    c = float(lines[4])  # x origin
+    f = float(lines[5])  # y origin
+    return Affine(a, b, c, d, e, f)
+
+
 def ingest(image_path: str, world_path: str | None, crs: str) -> str:
-    """Convert raw image + optional world file to GeoTIFF."""
+    """Convert raw image + optional world file to GeoTIFF using rasterio."""
     tmp = tempfile.mkdtemp(prefix="janus_")
     geotiff = os.path.join(tmp, "input.tif")
 
-    # If a world file was provided, place it next to the image with matching name
-    if world_path:
+    # Check if input is already a GeoTIFF
+    if image_path.lower().endswith((".tif", ".tiff")):
+        try:
+            with rasterio.open(image_path) as src:
+                if src.crs is not None and src.transform != Affine.identity():
+                    # Already georeferenced — copy with target CRS
+                    import shutil
+                    shutil.copy2(image_path, geotiff)
+                    return geotiff
+        except Exception:
+            pass
+
+    # Need a world file for raw images
+    if world_path is None:
+        # Try to find it automatically next to the image
         img_p = Path(image_path)
         expected_ext = WORLD_EXT_MAP.get(img_p.suffix.lower(), ".pgw")
-        wf_dest = img_p.with_suffix(expected_ext)
-        if not wf_dest.exists():
-            import shutil
-            shutil.copy2(world_path, str(wf_dest))
+        auto_wf = img_p.with_suffix(expected_ext)
+        if auto_wf.exists():
+            world_path = str(auto_wf)
+        else:
+            raise gr.Error(
+                f"No world file provided and none found next to image. "
+                f"Expected: {auto_wf.name}"
+            )
 
-    ds = gdal.Open(image_path)
-    if ds is None:
-        raise gr.Error(f"Cannot open image: {image_path}")
+    # Parse world file
+    transform = _parse_world_file(world_path)
+    target_crs = CRS.from_user_input(crs)
 
-    result = gdal.Translate(geotiff, ds, format="GTiff", outputSRS=crs)
-    ds = None
-    if result is None:
-        raise gr.Error("GeoTIFF conversion failed")
-    result = None
+    # Read image with PIL and write as GeoTIFF
+    img = Image.open(image_path).convert("RGB")
+    img_array = np.array(img)  # (H, W, 3)
+
+    height, width, bands = img_array.shape
+
+    profile = {
+        "driver": "GTiff",
+        "dtype": "uint8",
+        "width": width,
+        "height": height,
+        "count": bands,
+        "crs": target_crs,
+        "transform": transform,
+    }
+
+    with rasterio.open(geotiff, "w", **profile) as dst:
+        for band in range(bands):
+            dst.write(img_array[:, :, band], band + 1)
 
     return geotiff
 

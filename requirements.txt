@@ -4,8 +4,8 @@ torch
 geopandas>=0.14
 rasterio>=1.3
 shapely>=2.0
-GDAL>=3.6
+affine
+pyproj
 matplotlib
 Pillow
-gradio>=4.0
 huggingface_hub
