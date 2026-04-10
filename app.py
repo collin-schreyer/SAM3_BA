@@ -15,6 +15,7 @@ from pathlib import Path
 
 import gradio as gr
 import geopandas as gpd
+import spaces
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -455,6 +456,7 @@ def _fmt_time(secs: float) -> str:
 PREVIEW_INTERVAL = 20  # update overlay every N tiles
 
 
+@spaces.GPU(duration=3600)  # request GPU for up to 60 minutes
 def run_pipeline(
     image_file,
     world_file,
