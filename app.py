@@ -38,9 +38,34 @@ PROCESSOR = None
 
 def get_device():
     """Detect GPU at runtime, not import time."""
+    import subprocess
+    print(f"[GPU DEBUG] torch.cuda.is_available() = {torch.cuda.is_available()}")
+    print(f"[GPU DEBUG] torch.version.cuda = {torch.version.cuda}")
+    print(f"[GPU DEBUG] torch.backends.cudnn.enabled = {torch.backends.cudnn.enabled}")
+    try:
+        print(f"[GPU DEBUG] torch.cuda.device_count() = {torch.cuda.device_count()}")
+    except Exception as e:
+        print(f"[GPU DEBUG] torch.cuda.device_count() ERROR: {e}")
+    try:
+        result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
+        print(f"[GPU DEBUG] nvidia-smi output:\n{result.stdout[:500]}")
+        if result.stderr:
+            print(f"[GPU DEBUG] nvidia-smi stderr: {result.stderr[:200]}")
+    except Exception as e:
+        print(f"[GPU DEBUG] nvidia-smi ERROR: {e}")
+    try:
+        import os
+        print(f"[GPU DEBUG] CUDA_VISIBLE_DEVICES = {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}")
+        print(f"[GPU DEBUG] NVIDIA_VISIBLE_DEVICES = {os.environ.get('NVIDIA_VISIBLE_DEVICES', 'NOT SET')}")
+    except Exception as e:
+        print(f"[GPU DEBUG] env check ERROR: {e}")
     if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        print(f"[GPU DEBUG] Using GPU: {name}")
         return "cuda"
+    print("[GPU DEBUG] Falling back to CPU")
     return "cpu"
+
 matplotlib.use("Agg")
 
 # ---------------------------------------------------------------------------
