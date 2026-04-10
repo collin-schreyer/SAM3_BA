@@ -113,7 +113,6 @@ WORLD_EXT_MAP = {
 # Model
 # ---------------------------------------------------------------------------
 
-@spaces.GPU
 def load_model():
     global MODEL, PROCESSOR
     if MODEL is None:
@@ -534,9 +533,8 @@ def run_pipeline(
     yield None, "**Ingesting image...**", None
     geotiff = ingest(image_file, world_file, crs)
 
-    # -- Load model --
-    yield None, "**Loading SAM 3 model...** (first run downloads ~1.8 GB)", None
-    load_model()
+    # Model loads on first segment_tile call (inside @spaces.GPU context)
+    yield None, "**Starting extraction...** (model loads on first tile)", None
 
     # -- Compute tiles --
     with rasterio.open(geotiff) as src:
