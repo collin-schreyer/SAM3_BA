@@ -1,6 +1,6 @@
-"""Janus — Building Footprint Extraction via SAM 3.
+"""Janus — Feature Extraction via SAM 3.
 
-A Gradio app for extracting GIS-ready building footprints from aerial imagery
+A Gradio app for extracting GIS-ready vector features from aerial imagery
 using Meta's Segment Anything Model 3 with text prompts.
 """
 
@@ -47,6 +47,68 @@ def load_model():
 
 
 # ---------------------------------------------------------------------------
+# Feature type presets
+# ---------------------------------------------------------------------------
+
+FEATURE_PRESETS = {
+    "Building": {
+        "prompt": "building",
+        "min_area": 20.0,
+        "max_area": 50000.0,
+        "min_compactness": 0.25,
+        "min_rectangularity": 0.5,
+        "color": "#10b981",
+        "label": "Buildings",
+    },
+    "Road": {
+        "prompt": "road",
+        "min_area": 10.0,
+        "max_area": 500000.0,
+        "min_compactness": 0.0,
+        "min_rectangularity": 0.0,
+        "color": "#f59e0b",
+        "label": "Roads",
+    },
+    "Waterbody": {
+        "prompt": "water",
+        "min_area": 50.0,
+        "max_area": 5000000.0,
+        "min_compactness": 0.0,
+        "min_rectangularity": 0.0,
+        "color": "#3b82f6",
+        "label": "Waterbodies",
+    },
+    "Parking Lot": {
+        "prompt": "parking lot",
+        "min_area": 100.0,
+        "max_area": 200000.0,
+        "min_compactness": 0.2,
+        "min_rectangularity": 0.4,
+        "color": "#8b5cf6",
+        "label": "Parking Lots",
+    },
+    "Vegetation": {
+        "prompt": "tree",
+        "min_area": 30.0,
+        "max_area": 5000000.0,
+        "min_compactness": 0.0,
+        "min_rectangularity": 0.0,
+        "color": "#22c55e",
+        "label": "Vegetation",
+    },
+    "Custom": {
+        "prompt": "",
+        "min_area": 10.0,
+        "max_area": 5000000.0,
+        "min_compactness": 0.0,
+        "min_rectangularity": 0.0,
+        "color": "#ef4444",
+        "label": "Features",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
@@ -60,27 +122,16 @@ WORLD_EXT_MAP = {
 
 
 def _parse_world_file(world_path: str) -> Affine:
-    """Parse a 6-line world file into a rasterio Affine transform.
-
-    World file format:
-      line 0: x pixel size (a)
-      line 1: rotation (d)
-      line 2: rotation (b)
-      line 3: y pixel size, negative (e)
-      line 4: x origin - upper left pixel center (c)
-      line 5: y origin - upper left pixel center (f)
-
-    Affine(a, b, c, d, e, f)
-    """
+    """Parse a 6-line world file into a rasterio Affine transform."""
     lines = Path(world_path).read_text().strip().splitlines()
     if len(lines) < 6:
         raise gr.Error(f"World file must have 6 lines, got {len(lines)}")
-    a = float(lines[0])  # x pixel size
-    d = float(lines[1])  # rotation
-    b = float(lines[2])  # rotation
-    e = float(lines[3])  # y pixel size (negative)
-    c = float(lines[4])  # x origin
-    f = float(lines[5])  # y origin
+    a = float(lines[0])
+    d = float(lines[1])
+    b = float(lines[2])
+    e = float(lines[3])
+    c = float(lines[4])
+    f = float(lines[5])
     return Affine(a, b, c, d, e, f)
 
 
@@ -89,21 +140,17 @@ def ingest(image_path: str, world_path: str | None, crs: str) -> str:
     tmp = tempfile.mkdtemp(prefix="janus_")
     geotiff = os.path.join(tmp, "input.tif")
 
-    # Check if input is already a GeoTIFF
     if image_path.lower().endswith((".tif", ".tiff")):
         try:
             with rasterio.open(image_path) as src:
                 if src.crs is not None and src.transform != Affine.identity():
-                    # Already georeferenced — copy with target CRS
                     import shutil
                     shutil.copy2(image_path, geotiff)
                     return geotiff
         except Exception:
             pass
 
-    # Need a world file for raw images
     if world_path is None:
-        # Try to find it automatically next to the image
         img_p = Path(image_path)
         expected_ext = WORLD_EXT_MAP.get(img_p.suffix.lower(), ".pgw")
         auto_wf = img_p.with_suffix(expected_ext)
@@ -115,14 +162,11 @@ def ingest(image_path: str, world_path: str | None, crs: str) -> str:
                 f"Expected: {auto_wf.name}"
             )
 
-    # Parse world file
     transform = _parse_world_file(world_path)
     target_crs = CRS.from_user_input(crs)
 
-    # Read image with PIL and write as GeoTIFF
     img = Image.open(image_path).convert("RGB")
-    img_array = np.array(img)  # (H, W, 3)
-
+    img_array = np.array(img)
     height, width, bands = img_array.shape
 
     profile = {
@@ -160,9 +204,9 @@ def segment(geotiff: str, text_prompt: str, confidence: float) -> tuple[str, int
     )[0]
 
     masks = results["masks"].cpu().numpy()
+    scores = results["scores"].cpu().numpy()
     count = len(masks)
 
-    # Write labeled mask raster preserving georeferencing
     mask_path = geotiff.replace("input.tif", "masks.tif")
     with rasterio.open(geotiff) as src:
         profile = src.profile.copy()
@@ -172,6 +216,10 @@ def segment(geotiff: str, text_prompt: str, confidence: float) -> tuple[str, int
             labeled[mask > 0] = i + 1
         with rasterio.open(mask_path, "w", **profile) as dst:
             dst.write(labeled, 1)
+
+    # Save scores for later use
+    scores_path = geotiff.replace("input.tif", "scores.npy")
+    np.save(scores_path, scores)
 
     return mask_path, count
 
@@ -188,53 +236,118 @@ def vectorize(mask_path: str) -> gpd.GeoDataFrame:
             polys.append(shape(geom))
             vals.append(int(val))
 
-    return gpd.GeoDataFrame({"building_id": vals, "geometry": polys}, crs=crs)
+    gdf = gpd.GeoDataFrame({"feature_id": vals, "geometry": polys}, crs=crs)
 
+    # Attach confidence scores if available
+    scores_path = mask_path.replace("masks.tif", "scores.npy")
+    if os.path.exists(scores_path):
+        scores = np.load(scores_path)
+        # Map feature_id to score (feature_id is 1-indexed, scores are 0-indexed)
+        score_map = {i + 1: float(scores[i]) for i in range(len(scores))}
+        gdf["confidence"] = gdf["feature_id"].map(score_map).fillna(0.0).round(3)
 
-def filter_buildings(gdf: gpd.GeoDataFrame, min_area: float) -> gpd.GeoDataFrame:
-    """Filter polygons by area and compactness."""
-    if len(gdf) == 0:
-        return gdf
-
-    if gdf.crs and gdf.crs.is_geographic:
-        gdf_proj = gdf.to_crs(gdf.estimate_utm_crs())
-        gdf["area_m2"] = gdf_proj.geometry.area
-    else:
-        gdf["area_m2"] = gdf.geometry.area
-
-    gdf = gdf[gdf["area_m2"] >= min_area].copy()
-
-    def compactness(geom):
-        if geom.is_empty or geom.length == 0:
-            return 0.0
-        return (4.0 * math.pi * geom.area) / (geom.length**2)
-
-    gdf["compactness"] = gdf.geometry.apply(compactness)
-    gdf = gdf[gdf["compactness"] >= 0.15].copy()
     return gdf
 
 
-def export_files(gdf: gpd.GeoDataFrame, tmp_dir: str) -> list[str]:
+def _compactness(geom):
+    """Polsby-Popper compactness: 4*pi*area / perimeter^2."""
+    if geom.is_empty or geom.length == 0:
+        return 0.0
+    return (4.0 * math.pi * geom.area) / (geom.length ** 2)
+
+
+def _rectangularity(geom):
+    """Ratio of polygon area to its minimum rotated bounding rectangle."""
+    if geom.is_empty:
+        return 0.0
+    mrr = geom.minimum_rotated_rectangle
+    if mrr.area == 0:
+        return 0.0
+    return geom.area / mrr.area
+
+
+def filter_features(
+    gdf: gpd.GeoDataFrame,
+    min_area: float,
+    max_area: float,
+    min_compactness: float,
+    min_rectangularity: float,
+) -> gpd.GeoDataFrame:
+    """Filter polygons by area, compactness, and rectangularity."""
+    if len(gdf) == 0:
+        return gdf
+
+    # Compute area in meters
+    if gdf.crs and gdf.crs.is_geographic:
+        gdf_proj = gdf.to_crs(gdf.estimate_utm_crs())
+        gdf["area_m2"] = gdf_proj.geometry.area
+        proj_geom = gdf_proj.geometry
+    else:
+        gdf["area_m2"] = gdf.geometry.area
+        proj_geom = gdf.geometry
+
+    # Area filter
+    gdf = gdf[(gdf["area_m2"] >= min_area) & (gdf["area_m2"] <= max_area)].copy()
+
+    if len(gdf) == 0:
+        return gdf
+
+    # Recompute projected geometry after filter
+    if gdf.crs and gdf.crs.is_geographic:
+        gdf_proj = gdf.to_crs(gdf.estimate_utm_crs())
+        proj_geom = gdf_proj.geometry
+    else:
+        proj_geom = gdf.geometry
+
+    # Compactness filter
+    if min_compactness > 0:
+        gdf["compactness"] = proj_geom.apply(_compactness)
+        gdf = gdf[gdf["compactness"] >= min_compactness].copy()
+    else:
+        gdf["compactness"] = proj_geom.apply(_compactness)
+
+    if len(gdf) == 0:
+        return gdf
+
+    # Rectangularity filter
+    if min_rectangularity > 0:
+        if gdf.crs and gdf.crs.is_geographic:
+            gdf_proj2 = gdf.to_crs(gdf.estimate_utm_crs())
+            proj_geom2 = gdf_proj2.geometry
+        else:
+            proj_geom2 = gdf.geometry
+        gdf["rectangularity"] = proj_geom2.apply(_rectangularity)
+        gdf = gdf[gdf["rectangularity"] >= min_rectangularity].copy()
+    else:
+        gdf["rectangularity"] = 0.0
+
+    return gdf
+
+
+def export_files(gdf: gpd.GeoDataFrame, tmp_dir: str, label: str) -> list[str]:
     """Export to GeoPackage, GeoJSON, and WKT. Return list of file paths."""
     paths = []
-    gpkg = os.path.join(tmp_dir, "buildings.gpkg")
+    name = label.lower().replace(" ", "_")
+
+    gpkg = os.path.join(tmp_dir, f"{name}.gpkg")
     gdf.to_file(gpkg, driver="GPKG")
     paths.append(gpkg)
 
-    geojson = os.path.join(tmp_dir, "buildings.geojson")
+    geojson = os.path.join(tmp_dir, f"{name}.geojson")
     gdf.to_file(geojson, driver="GeoJSON")
     paths.append(geojson)
 
-    wkt_path = os.path.join(tmp_dir, "buildings.wkt")
+    wkt_path = os.path.join(tmp_dir, f"{name}.wkt")
     with open(wkt_path, "w") as f:
         for idx, row in enumerate(gdf.itertuples(), start=1):
-            f.write(f"{idx}|{row.geometry.wkt}\n")
+            conf = getattr(row, "confidence", 0.0)
+            f.write(f"{idx}|{conf:.3f}|{row.geometry.wkt}\n")
     paths.append(wkt_path)
 
     return paths
 
 
-def make_overlay(geotiff: str, gdf: gpd.GeoDataFrame) -> str:
+def make_overlay(geotiff: str, gdf: gpd.GeoDataFrame, color: str, label: str) -> str:
     """Create a comparison overlay image. Returns path to PNG."""
     fig, axes = plt.subplots(1, 2, figsize=(16, 7), dpi=120)
     fig.patch.set_facecolor("#fafafa")
@@ -249,13 +362,13 @@ def make_overlay(geotiff: str, gdf: gpd.GeoDataFrame) -> str:
     if len(gdf) > 0:
         gdf.plot(
             ax=axes[1],
-            edgecolor="#10b981",
-            facecolor="#10b981",
+            edgecolor=color,
+            facecolor=color,
             alpha=0.35,
             linewidth=1.5,
         )
     axes[1].set_title(
-        f"{len(gdf)} Buildings Extracted",
+        f"{len(gdf)} {label} Extracted",
         fontsize=14,
         fontweight=600,
         color="#18181b",
@@ -275,6 +388,25 @@ def make_overlay(geotiff: str, gdf: gpd.GeoDataFrame) -> str:
 
 
 # ---------------------------------------------------------------------------
+# UI callbacks
+# ---------------------------------------------------------------------------
+
+
+def on_feature_type_change(feature_type: str):
+    """Update controls when feature type preset changes."""
+    preset = FEATURE_PRESETS[feature_type]
+    custom_visible = feature_type == "Custom"
+    return (
+        preset["prompt"],            # text prompt
+        preset["min_area"],          # min area slider
+        preset["min_compactness"],   # compactness slider
+        preset["min_rectangularity"],  # rectangularity slider
+        gr.update(visible=custom_visible),  # custom prompt visibility
+        gr.update(visible=custom_visible),  # advanced filters visibility
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline function
 # ---------------------------------------------------------------------------
 
@@ -283,14 +415,27 @@ def run_pipeline(
     image_file,
     world_file,
     crs: str,
-    text_prompt: str,
+    feature_type: str,
+    custom_prompt: str,
     confidence: float,
     min_area: float,
+    min_compactness: float,
+    min_rectangularity: float,
     progress=gr.Progress(track_tqdm=True),
 ):
     """Run the full Janus pipeline end to end."""
     if image_file is None:
         raise gr.Error("Please upload an aerial image.")
+
+    preset = FEATURE_PRESETS[feature_type]
+    text_prompt = custom_prompt if feature_type == "Custom" else preset["prompt"]
+
+    if not text_prompt.strip():
+        raise gr.Error("Please enter a text prompt.")
+
+    color = preset["color"]
+    label = preset["label"] if feature_type != "Custom" else "Features"
+    max_area = preset["max_area"]
 
     progress(0.05, desc="Ingesting image")
     geotiff = ingest(image_file, world_file, crs)
@@ -304,28 +449,39 @@ def run_pipeline(
     progress(0.65, desc="Vectorizing masks")
     gdf = vectorize(mask_path)
 
-    progress(0.75, desc="Filtering polygons")
-    gdf = filter_buildings(gdf, min_area)
+    progress(0.75, desc="Filtering features")
+    gdf = filter_features(gdf, min_area, max_area, min_compactness, min_rectangularity)
     filtered_count = len(gdf)
 
     progress(0.85, desc="Exporting files")
     tmp_dir = os.path.dirname(geotiff)
-    export_paths = export_files(gdf, tmp_dir)
+    export_paths = export_files(gdf, tmp_dir, label)
 
     progress(0.95, desc="Generating overlay")
-    overlay = make_overlay(geotiff, gdf)
+    overlay = make_overlay(geotiff, gdf, color, label)
+
+    # Build summary with confidence stats
+    conf_info = ""
+    if "confidence" in gdf.columns and len(gdf) > 0:
+        conf_info = (
+            f"\n\nConfidence: "
+            f"min {gdf['confidence'].min():.2f} / "
+            f"mean {gdf['confidence'].mean():.2f} / "
+            f"max {gdf['confidence'].max():.2f}"
+        )
 
     stats = (
-        f"**{filtered_count}** buildings extracted "
+        f"**{filtered_count}** {label.lower()} extracted "
         f"({raw_count} raw segments, {raw_count - filtered_count} filtered)\n\n"
         f"Min area: {min_area} m\u00b2 | CRS: {crs} | Prompt: \"{text_prompt}\""
+        f"{conf_info}"
     )
 
     return overlay, stats, export_paths
 
 
 # ---------------------------------------------------------------------------
-# Gradio UI (taste-skill: no emojis, no Inter, no purple, no centered hero)
+# Gradio UI
 # ---------------------------------------------------------------------------
 
 CUSTOM_CSS = """
@@ -423,10 +579,10 @@ footer { display: none !important; }
 
 HEADER_MD = """
 # Janus
-### GIS-ready building footprint extraction from aerial imagery
+### GIS-ready feature extraction from aerial imagery
 
-Upload a high-resolution aerial image with its world file, and Janus will detect
-every building using SAM 3 text prompts \u2014 returning clean, georeferenced vector
+Upload a high-resolution aerial image with its world file, select a feature type,
+and Janus will detect every instance using SAM 3 \u2014 returning georeferenced vector
 polygons ready for GIS workflows.
 """
 
@@ -437,13 +593,12 @@ gpu_status = (
     else "No GPU detected \u2014 inference will be slow"
 )
 
-with gr.Blocks(css=CUSTOM_CSS, title="Janus \u2014 Building Footprints") as demo:
-    # Header (left-aligned per taste-skill rule 3: anti-center bias)
+with gr.Blocks(css=CUSTOM_CSS, title="Janus \u2014 Feature Extraction") as demo:
     gr.Markdown(HEADER_MD)
     gr.Markdown(f"*{gpu_status}*")
 
     with gr.Row(equal_height=False):
-        # Left column: inputs (wider)
+        # Left column: inputs
         with gr.Column(scale=3):
             with gr.Group():
                 image_input = gr.File(
@@ -464,36 +619,61 @@ with gr.Blocks(css=CUSTOM_CSS, title="Janus \u2014 Building Footprints") as demo
                     info="Coordinate reference system",
                     scale=1,
                 )
-                prompt_input = gr.Textbox(
-                    value="building",
-                    label="Text Prompt",
-                    info="SAM 3 concept to detect",
+                feature_type = gr.Dropdown(
+                    choices=list(FEATURE_PRESETS.keys()),
+                    value="Building",
+                    label="Feature Type",
+                    info="Select a preset or choose Custom",
                     scale=2,
                 )
 
-            with gr.Row():
-                confidence_slider = gr.Slider(
-                    minimum=0.1,
-                    maximum=0.95,
-                    value=0.5,
-                    step=0.05,
-                    label="Confidence Threshold",
-                )
-                area_slider = gr.Slider(
-                    minimum=5,
-                    maximum=200,
+            custom_prompt = gr.Textbox(
+                value="",
+                label="Custom Text Prompt",
+                info="Describe the feature to detect (e.g. 'solar panel', 'swimming pool')",
+                visible=False,
+            )
+
+            confidence_slider = gr.Slider(
+                minimum=0.1,
+                maximum=0.95,
+                value=0.5,
+                step=0.05,
+                label="Confidence Threshold",
+            )
+
+            with gr.Accordion("Advanced Filters", open=False, visible=True) as adv_filters:
+                min_area_slider = gr.Slider(
+                    minimum=1,
+                    maximum=500,
                     value=20,
                     step=5,
                     label="Min Area (m\u00b2)",
                 )
+                compactness_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=0.8,
+                    value=0.25,
+                    step=0.05,
+                    label="Min Compactness",
+                    info="Higher = more compact shapes only (buildings). Lower = allow elongated shapes (roads).",
+                )
+                rectangularity_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=0.9,
+                    value=0.5,
+                    step=0.05,
+                    label="Min Rectangularity",
+                    info="Higher = more rectangular. Set to 0 for organic shapes (water, roads).",
+                )
 
             run_btn = gr.Button(
-                "Extract Footprints",
+                "Extract Features",
                 variant="primary",
                 size="lg",
             )
 
-        # Right column: outputs (narrower)
+        # Right column: outputs
         with gr.Column(scale=4):
             output_image = gr.Image(
                 label="Result",
@@ -503,16 +683,33 @@ with gr.Blocks(css=CUSTOM_CSS, title="Janus \u2014 Building Footprints") as demo
             stats_output = gr.Markdown(label="Summary")
             file_output = gr.Files(label="Download GIS Files")
 
-    # Wire it up
+    # Preset change updates controls
+    feature_type.change(
+        fn=on_feature_type_change,
+        inputs=[feature_type],
+        outputs=[
+            custom_prompt,           # updates value (text prompt)
+            min_area_slider,         # updates value
+            compactness_slider,      # updates value
+            rectangularity_slider,   # updates value
+            custom_prompt,           # updates visibility
+            adv_filters,             # updates visibility (show for custom)
+        ],
+    )
+
+    # Run pipeline
     run_btn.click(
         fn=run_pipeline,
         inputs=[
             image_input,
             world_input,
             crs_input,
-            prompt_input,
+            feature_type,
+            custom_prompt,
             confidence_slider,
-            area_slider,
+            min_area_slider,
+            compactness_slider,
+            rectangularity_slider,
         ],
         outputs=[output_image, stats_output, file_output],
     )
