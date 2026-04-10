@@ -1,7 +1,7 @@
-"""Janus — Feature Extraction via SAM 3.
+"""Janus — Feature Extraction via SAM 3 with Tiling + Live Dashboard.
 
-A Gradio app for extracting GIS-ready vector features from aerial imagery
-using Meta's Segment Anything Model 3 with text prompts.
+Upload large GeoTIFFs, select feature types, and watch as SAM 3 processes
+tile by tile with live progress and confidence tracking.
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import gradio as gr
@@ -23,120 +25,85 @@ from PIL import Image
 from pyproj import CRS
 from rasterio.features import shapes
 from rasterio.plot import show
+from rasterio.windows import Window
 from shapely.geometry import shape
 
 # ---------------------------------------------------------------------------
-# Global model state (loaded once, reused across requests)
+# Globals
 # ---------------------------------------------------------------------------
 MODEL = None
 PROCESSOR = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 matplotlib.use("Agg")
 
+# ---------------------------------------------------------------------------
+# Feature presets
+# ---------------------------------------------------------------------------
+FEATURE_PRESETS = {
+    "Building": {
+        "prompt": "building",
+        "min_area": 20.0, "max_area": 50000.0,
+        "min_compactness": 0.25, "min_rectangularity": 0.5,
+        "color": "#10b981",
+    },
+    "Road": {
+        "prompt": "road",
+        "min_area": 10.0, "max_area": 500000.0,
+        "min_compactness": 0.0, "min_rectangularity": 0.0,
+        "color": "#f59e0b",
+    },
+    "Waterbody": {
+        "prompt": "water",
+        "min_area": 50.0, "max_area": 5000000.0,
+        "min_compactness": 0.0, "min_rectangularity": 0.0,
+        "color": "#3b82f6",
+    },
+    "Vegetation": {
+        "prompt": "tree",
+        "min_area": 30.0, "max_area": 5000000.0,
+        "min_compactness": 0.0, "min_rectangularity": 0.0,
+        "color": "#22c55e",
+    },
+    "Parking Lot": {
+        "prompt": "parking lot",
+        "min_area": 100.0, "max_area": 200000.0,
+        "min_compactness": 0.2, "min_rectangularity": 0.4,
+        "color": "#8b5cf6",
+    },
+}
+
+WORLD_EXT_MAP = {
+    ".png": ".pgw", ".jpg": ".jgw", ".jpeg": ".jgw",
+    ".tif": ".tfw", ".tiff": ".tfw",
+}
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 def load_model():
-    """Load SAM 3 model and processor (cached globally)."""
     global MODEL, PROCESSOR
     if MODEL is None:
         from transformers import Sam3Model, Sam3Processor
-
         MODEL = Sam3Model.from_pretrained("facebook/sam3").to(DEVICE)
         PROCESSOR = Sam3Processor.from_pretrained("facebook/sam3")
     return MODEL, PROCESSOR
 
-
 # ---------------------------------------------------------------------------
-# Feature type presets
+# Ingest
 # ---------------------------------------------------------------------------
-
-FEATURE_PRESETS = {
-    "Building": {
-        "prompt": "building",
-        "min_area": 20.0,
-        "max_area": 50000.0,
-        "min_compactness": 0.25,
-        "min_rectangularity": 0.5,
-        "color": "#10b981",
-        "label": "Buildings",
-    },
-    "Road": {
-        "prompt": "road",
-        "min_area": 10.0,
-        "max_area": 500000.0,
-        "min_compactness": 0.0,
-        "min_rectangularity": 0.0,
-        "color": "#f59e0b",
-        "label": "Roads",
-    },
-    "Waterbody": {
-        "prompt": "water",
-        "min_area": 50.0,
-        "max_area": 5000000.0,
-        "min_compactness": 0.0,
-        "min_rectangularity": 0.0,
-        "color": "#3b82f6",
-        "label": "Waterbodies",
-    },
-    "Parking Lot": {
-        "prompt": "parking lot",
-        "min_area": 100.0,
-        "max_area": 200000.0,
-        "min_compactness": 0.2,
-        "min_rectangularity": 0.4,
-        "color": "#8b5cf6",
-        "label": "Parking Lots",
-    },
-    "Vegetation": {
-        "prompt": "tree",
-        "min_area": 30.0,
-        "max_area": 5000000.0,
-        "min_compactness": 0.0,
-        "min_rectangularity": 0.0,
-        "color": "#22c55e",
-        "label": "Vegetation",
-    },
-    "Custom": {
-        "prompt": "",
-        "min_area": 10.0,
-        "max_area": 5000000.0,
-        "min_compactness": 0.0,
-        "min_rectangularity": 0.0,
-        "color": "#ef4444",
-        "label": "Features",
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# Pipeline stages
-# ---------------------------------------------------------------------------
-
-WORLD_EXT_MAP = {
-    ".png": ".pgw",
-    ".jpg": ".jgw",
-    ".jpeg": ".jgw",
-    ".tif": ".tfw",
-    ".tiff": ".tfw",
-}
-
 
 def _parse_world_file(world_path: str) -> Affine:
-    """Parse a 6-line world file into a rasterio Affine transform."""
     lines = Path(world_path).read_text().strip().splitlines()
     if len(lines) < 6:
         raise gr.Error(f"World file must have 6 lines, got {len(lines)}")
-    a = float(lines[0])
-    d = float(lines[1])
-    b = float(lines[2])
-    e = float(lines[3])
-    c = float(lines[4])
-    f = float(lines[5])
-    return Affine(a, b, c, d, e, f)
+    return Affine(
+        float(lines[0]), float(lines[2]), float(lines[4]),
+        float(lines[1]), float(lines[3]), float(lines[5]),
+    )
 
 
 def ingest(image_path: str, world_path: str | None, crs: str) -> str:
-    """Convert raw image + optional world file to GeoTIFF using rasterio."""
     tmp = tempfile.mkdtemp(prefix="janus_")
     geotiff = os.path.join(tmp, "input.tif")
 
@@ -157,223 +124,203 @@ def ingest(image_path: str, world_path: str | None, crs: str) -> str:
         if auto_wf.exists():
             world_path = str(auto_wf)
         else:
-            raise gr.Error(
-                f"No world file provided and none found next to image. "
-                f"Expected: {auto_wf.name}"
-            )
+            raise gr.Error(f"No world file found. Expected: {auto_wf.name}")
 
     transform = _parse_world_file(world_path)
     target_crs = CRS.from_user_input(crs)
-
     img = Image.open(image_path).convert("RGB")
     img_array = np.array(img)
-    height, width, bands = img_array.shape
-
+    h, w, bands = img_array.shape
     profile = {
-        "driver": "GTiff",
-        "dtype": "uint8",
-        "width": width,
-        "height": height,
-        "count": bands,
-        "crs": target_crs,
-        "transform": transform,
+        "driver": "GTiff", "dtype": "uint8",
+        "width": w, "height": h, "count": bands,
+        "crs": target_crs, "transform": transform,
     }
-
     with rasterio.open(geotiff, "w", **profile) as dst:
-        for band in range(bands):
-            dst.write(img_array[:, :, band], band + 1)
-
+        for b in range(bands):
+            dst.write(img_array[:, :, b], b + 1)
     return geotiff
 
+# ---------------------------------------------------------------------------
+# Tiling
+# ---------------------------------------------------------------------------
 
-def segment(geotiff: str, text_prompt: str, confidence: float) -> tuple[str, int]:
-    """Run SAM 3 text-prompted segmentation. Returns (mask_path, count)."""
+def compute_tile_windows(img_w: int, img_h: int, tile_size: int, overlap: int) -> list[Window]:
+    step = tile_size - overlap
+    windows = []
+    for y in range(0, img_h, step):
+        for x in range(0, img_w, step):
+            tw = min(tile_size, img_w - x)
+            th = min(tile_size, img_h - y)
+            if tw < tile_size // 4 or th < tile_size // 4:
+                continue
+            windows.append(Window(x, y, tw, th))
+    return windows
+
+# ---------------------------------------------------------------------------
+# Per-tile segmentation
+# ---------------------------------------------------------------------------
+
+def segment_tile(tile_rgb: np.ndarray, prompt: str, confidence: float):
     model, processor = load_model()
-
-    image = Image.open(geotiff).convert("RGB")
-    inputs = processor(images=image, text=text_prompt, return_tensors="pt").to(DEVICE)
-
+    image = Image.fromarray(tile_rgb)
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         outputs = model(**inputs)
-
     results = processor.post_process_instance_segmentation(
-        outputs,
-        threshold=confidence,
-        mask_threshold=0.5,
+        outputs, threshold=confidence, mask_threshold=0.5,
         target_sizes=inputs.get("original_sizes").tolist(),
     )[0]
+    return results["masks"].cpu().numpy(), results["scores"].cpu().numpy()
 
-    masks = results["masks"].cpu().numpy()
-    scores = results["scores"].cpu().numpy()
-    count = len(masks)
-
-    mask_path = geotiff.replace("input.tif", "masks.tif")
-    with rasterio.open(geotiff) as src:
-        profile = src.profile.copy()
-        profile.update(count=1, dtype="int32", nodata=0)
-        labeled = np.zeros((src.height, src.width), dtype=np.int32)
-        for i, mask in enumerate(masks):
-            labeled[mask > 0] = i + 1
-        with rasterio.open(mask_path, "w", **profile) as dst:
-            dst.write(labeled, 1)
-
-    # Save scores for later use
-    scores_path = geotiff.replace("input.tif", "scores.npy")
-    np.save(scores_path, scores)
-
-    return mask_path, count
-
-
-def vectorize(mask_path: str) -> gpd.GeoDataFrame:
-    """Convert raster mask to GeoDataFrame of polygons."""
-    with rasterio.open(mask_path) as src:
-        data = src.read(1)
-        transform = src.transform
-        crs = src.crs
-
-        polys, vals = [], []
-        for geom, val in shapes(data, mask=(data > 0), transform=transform):
-            polys.append(shape(geom))
-            vals.append(int(val))
-
-    gdf = gpd.GeoDataFrame({"feature_id": vals, "geometry": polys}, crs=crs)
-
-    # Attach confidence scores if available
-    scores_path = mask_path.replace("masks.tif", "scores.npy")
-    if os.path.exists(scores_path):
-        scores = np.load(scores_path)
-        # Map feature_id to score (feature_id is 1-indexed, scores are 0-indexed)
-        score_map = {i + 1: float(scores[i]) for i in range(len(scores))}
-        gdf["confidence"] = gdf["feature_id"].map(score_map).fillna(0.0).round(3)
-
-    return gdf
-
+# ---------------------------------------------------------------------------
+# Shape metrics
+# ---------------------------------------------------------------------------
 
 def _compactness(geom):
-    """Polsby-Popper compactness: 4*pi*area / perimeter^2."""
     if geom.is_empty or geom.length == 0:
         return 0.0
     return (4.0 * math.pi * geom.area) / (geom.length ** 2)
 
-
 def _rectangularity(geom):
-    """Ratio of polygon area to its minimum rotated bounding rectangle."""
     if geom.is_empty:
         return 0.0
     mrr = geom.minimum_rotated_rectangle
-    if mrr.area == 0:
-        return 0.0
-    return geom.area / mrr.area
+    return geom.area / mrr.area if mrr.area > 0 else 0.0
 
+# ---------------------------------------------------------------------------
+# Dedup + filter
+# ---------------------------------------------------------------------------
 
-def filter_features(
-    gdf: gpd.GeoDataFrame,
-    min_area: float,
-    max_area: float,
-    min_compactness: float,
-    min_rectangularity: float,
-) -> gpd.GeoDataFrame:
-    """Filter polygons by area, compactness, and rectangularity."""
+def merge_and_deduplicate(features: list[dict], crs_obj, iou_thresh: float = 0.5) -> gpd.GeoDataFrame:
+    if not features:
+        return gpd.GeoDataFrame(columns=["feature_id", "feature_type", "confidence", "geometry"])
+    gdf = gpd.GeoDataFrame(features, crs=crs_obj)
     if len(gdf) == 0:
         return gdf
-
-    # Compute area in meters
-    if gdf.crs and gdf.crs.is_geographic:
-        gdf_proj = gdf.to_crs(gdf.estimate_utm_crs())
-        gdf["area_m2"] = gdf_proj.geometry.area
-        proj_geom = gdf_proj.geometry
-    else:
-        gdf["area_m2"] = gdf.geometry.area
-        proj_geom = gdf.geometry
-
-    # Area filter
-    gdf = gdf[(gdf["area_m2"] >= min_area) & (gdf["area_m2"] <= max_area)].copy()
-
-    if len(gdf) == 0:
-        return gdf
-
-    # Recompute projected geometry after filter
-    if gdf.crs and gdf.crs.is_geographic:
-        gdf_proj = gdf.to_crs(gdf.estimate_utm_crs())
-        proj_geom = gdf_proj.geometry
-    else:
-        proj_geom = gdf.geometry
-
-    # Compactness filter
-    if min_compactness > 0:
-        gdf["compactness"] = proj_geom.apply(_compactness)
-        gdf = gdf[gdf["compactness"] >= min_compactness].copy()
-    else:
-        gdf["compactness"] = proj_geom.apply(_compactness)
-
-    if len(gdf) == 0:
-        return gdf
-
-    # Rectangularity filter
-    if min_rectangularity > 0:
-        if gdf.crs and gdf.crs.is_geographic:
-            gdf_proj2 = gdf.to_crs(gdf.estimate_utm_crs())
-            proj_geom2 = gdf_proj2.geometry
-        else:
-            proj_geom2 = gdf.geometry
-        gdf["rectangularity"] = proj_geom2.apply(_rectangularity)
-        gdf = gdf[gdf["rectangularity"] >= min_rectangularity].copy()
-    else:
-        gdf["rectangularity"] = 0.0
-
+    sindex = gdf.sindex
+    drop = set()
+    for idx, row in gdf.iterrows():
+        if idx in drop:
+            continue
+        for cand_idx in sindex.intersection(row.geometry.bounds):
+            if cand_idx <= idx or cand_idx in drop:
+                continue
+            cand = gdf.loc[cand_idx]
+            if row["feature_type"] != cand["feature_type"]:
+                continue
+            if not row.geometry.intersects(cand.geometry):
+                continue
+            try:
+                inter = row.geometry.intersection(cand.geometry).area
+                union = row.geometry.union(cand.geometry).area
+                if union > 0 and inter / union >= iou_thresh:
+                    if row["confidence"] >= cand["confidence"]:
+                        drop.add(cand_idx)
+                    else:
+                        drop.add(idx)
+                        break
+            except Exception:
+                continue
+    gdf = gdf.drop(index=drop).reset_index(drop=True)
+    gdf["feature_id"] = range(1, len(gdf) + 1)
     return gdf
 
 
-def export_files(gdf: gpd.GeoDataFrame, tmp_dir: str, label: str) -> list[str]:
-    """Export to GeoPackage, GeoJSON, and WKT. Return list of file paths."""
+def filter_features(gdf: gpd.GeoDataFrame, preset: dict) -> gpd.GeoDataFrame:
+    if len(gdf) == 0:
+        return gdf
+    if gdf.crs and gdf.crs.is_geographic:
+        proj = gdf.to_crs(gdf.estimate_utm_crs())
+        gdf["area_m2"] = proj.geometry.area
+        pg = proj.geometry
+    else:
+        gdf["area_m2"] = gdf.geometry.area
+        pg = gdf.geometry
+    gdf = gdf[(gdf["area_m2"] >= preset["min_area"]) & (gdf["area_m2"] <= preset["max_area"])].copy()
+    if len(gdf) == 0:
+        return gdf
+    if gdf.crs and gdf.crs.is_geographic:
+        pg = gdf.to_crs(gdf.estimate_utm_crs()).geometry
+    else:
+        pg = gdf.geometry
+    gdf["compactness"] = pg.apply(_compactness)
+    if preset["min_compactness"] > 0:
+        gdf = gdf[gdf["compactness"] >= preset["min_compactness"]].copy()
+    if len(gdf) == 0:
+        return gdf
+    if preset["min_rectangularity"] > 0:
+        if gdf.crs and gdf.crs.is_geographic:
+            pg = gdf.to_crs(gdf.estimate_utm_crs()).geometry
+        else:
+            pg = gdf.geometry
+        gdf["rectangularity"] = pg.apply(_rectangularity)
+        gdf = gdf[gdf["rectangularity"] >= preset["min_rectangularity"]].copy()
+    return gdf
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def export_all(features_by_type: dict[str, gpd.GeoDataFrame], tmp_dir: str) -> list[str]:
     paths = []
-    name = label.lower().replace(" ", "_")
-
-    gpkg = os.path.join(tmp_dir, f"{name}.gpkg")
-    gdf.to_file(gpkg, driver="GPKG")
-    paths.append(gpkg)
-
-    geojson = os.path.join(tmp_dir, f"{name}.geojson")
-    gdf.to_file(geojson, driver="GeoJSON")
-    paths.append(geojson)
-
-    wkt_path = os.path.join(tmp_dir, f"{name}.wkt")
-    with open(wkt_path, "w") as f:
-        for idx, row in enumerate(gdf.itertuples(), start=1):
-            conf = getattr(row, "confidence", 0.0)
-            f.write(f"{idx}|{conf:.3f}|{row.geometry.wkt}\n")
-    paths.append(wkt_path)
-
+    for feat_type, gdf in features_by_type.items():
+        if len(gdf) == 0:
+            continue
+        name = feat_type.lower().replace(" ", "_")
+        gpkg = os.path.join(tmp_dir, f"{name}.gpkg")
+        gdf.to_file(gpkg, driver="GPKG")
+        paths.append(gpkg)
+        gj = os.path.join(tmp_dir, f"{name}.geojson")
+        gdf.to_file(gj, driver="GeoJSON")
+        paths.append(gj)
+        wkt = os.path.join(tmp_dir, f"{name}.wkt")
+        with open(wkt, "w") as f:
+            for idx, row in enumerate(gdf.itertuples(), start=1):
+                c = getattr(row, "confidence", 0.0)
+                f.write(f"{idx}|{c:.3f}|{row.geometry.wkt}\n")
+        paths.append(wkt)
     return paths
 
+# ---------------------------------------------------------------------------
+# Overlay
+# ---------------------------------------------------------------------------
 
-def make_overlay(geotiff: str, gdf: gpd.GeoDataFrame, color: str, label: str) -> str:
-    """Create a comparison overlay image. Returns path to PNG."""
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7), dpi=120)
+def make_overlay(geotiff: str, features_by_type: dict[str, gpd.GeoDataFrame]) -> str:
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), dpi=100)
     fig.patch.set_facecolor("#fafafa")
-
     with rasterio.open(geotiff) as src:
-        show(src, ax=axes[0])
-        show(src, ax=axes[1])
+        # For large images, read at reduced resolution
+        max_dim = 2000
+        scale = min(1.0, max_dim / max(src.width, src.height))
+        out_w = int(src.width * scale)
+        out_h = int(src.height * scale)
+        data = src.read(
+            out_shape=(src.count, out_h, out_w),
+            resampling=rasterio.enums.Resampling.bilinear,
+        )
+        extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
 
+    rgb = np.transpose(data[:3], (1, 2, 0))
+    axes[0].imshow(rgb, extent=extent)
     axes[0].set_title("Input", fontsize=14, fontweight=600, color="#18181b", pad=12)
     axes[0].tick_params(labelsize=7, colors="#71717a")
 
-    if len(gdf) > 0:
-        gdf.plot(
-            ax=axes[1],
-            edgecolor=color,
-            facecolor=color,
-            alpha=0.35,
-            linewidth=1.5,
-        )
-    axes[1].set_title(
-        f"{len(gdf)} {label} Extracted",
-        fontsize=14,
-        fontweight=600,
-        color="#18181b",
-        pad=12,
-    )
+    axes[1].imshow(rgb, extent=extent)
+    total = 0
+    legend_items = []
+    for feat_type, gdf in features_by_type.items():
+        if len(gdf) == 0:
+            continue
+        color = FEATURE_PRESETS.get(feat_type, {}).get("color", "#ef4444")
+        gdf.plot(ax=axes[1], edgecolor=color, facecolor=color, alpha=0.35, linewidth=1)
+        total += len(gdf)
+        legend_items.append(f"{feat_type}: {len(gdf)}")
+
+    title = f"{total} Features Extracted"
+    if legend_items:
+        title += f" ({', '.join(legend_items)})"
+    axes[1].set_title(title, fontsize=12, fontweight=600, color="#18181b", pad=12)
     axes[1].tick_params(labelsize=7, colors="#71717a")
 
     for ax in axes:
@@ -381,103 +328,242 @@ def make_overlay(geotiff: str, gdf: gpd.GeoDataFrame, color: str, label: str) ->
             spine.set_color("#e4e4e7")
 
     plt.tight_layout(pad=2)
-    out = geotiff.replace("input.tif", "comparison.png")
+    out = os.path.join(os.path.dirname(geotiff), "overlay.png")
     plt.savefig(out, bbox_inches="tight", facecolor="#fafafa")
     plt.close()
     return out
 
+# ---------------------------------------------------------------------------
+# Dashboard formatting
+# ---------------------------------------------------------------------------
+
+class ConfidenceTracker:
+    """Track running confidence stats per feature type."""
+    def __init__(self):
+        self.scores: dict[str, list[float]] = defaultdict(list)
+
+    def add(self, feat_type: str, score: float):
+        self.scores[feat_type].append(score)
+
+    def count(self, feat_type: str) -> int:
+        return len(self.scores[feat_type])
+
+    def total(self) -> int:
+        return sum(len(v) for v in self.scores.values())
+
+    def stats(self, feat_type: str) -> dict:
+        s = self.scores[feat_type]
+        if not s:
+            return {"count": 0, "avg": 0, "min": 0, "max": 0, "low": 0}
+        return {
+            "count": len(s),
+            "avg": sum(s) / len(s),
+            "min": min(s),
+            "max": max(s),
+            "low": sum(1 for x in s if x < 0.5),
+        }
+
+
+def format_dashboard(
+    image_name: str,
+    img_w: int,
+    img_h: int,
+    tile_idx: int,
+    total_tiles: int,
+    elapsed: float,
+    tracker: ConfidenceTracker,
+    feature_types: list[str],
+    status: str = "Processing",
+) -> str:
+    pct = (tile_idx / total_tiles * 100) if total_tiles > 0 else 0
+    elapsed_str = _fmt_time(elapsed)
+
+    if tile_idx > 0 and tile_idx < total_tiles:
+        rate = elapsed / tile_idx
+        remaining = rate * (total_tiles - tile_idx)
+        remaining_str = _fmt_time(remaining)
+    else:
+        remaining_str = "--"
+
+    md = f"**{status}: {image_name}** ({img_w:,} x {img_h:,} px)\n\n"
+    md += f"Tile {tile_idx} / {total_tiles} | {pct:.0f}% | "
+    md += f"Elapsed: {elapsed_str} | Remaining: ~{remaining_str}\n\n"
+
+    md += "| Feature | Count | Avg Conf | Min Conf | Max Conf | Low (<0.5) |\n"
+    md += "|---------|-------|----------|----------|----------|------------|\n"
+
+    for ft in feature_types:
+        st = tracker.stats(ft)
+        if st["count"] > 0:
+            md += (
+                f"| {ft} | {st['count']} | {st['avg']:.2f} | "
+                f"{st['min']:.2f} | {st['max']:.2f} | {st['low']} |\n"
+            )
+        else:
+            md += f"| {ft} | 0 | -- | -- | -- | -- |\n"
+
+    return md
+
+
+def format_final_summary(
+    tracker: ConfidenceTracker,
+    feature_types: list[str],
+    final_counts: dict[str, int],
+    elapsed: float,
+) -> str:
+    md = f"**Extraction Complete** | Total time: {_fmt_time(elapsed)}\n\n"
+
+    md += "| Feature | Raw | Final | Avg Conf | Min | Max | Low (<0.5) |\n"
+    md += "|---------|-----|-------|----------|-----|-----|------------|\n"
+
+    for ft in feature_types:
+        st = tracker.stats(ft)
+        final = final_counts.get(ft, 0)
+        if st["count"] > 0:
+            md += (
+                f"| {ft} | {st['count']} | {final} | "
+                f"{st['avg']:.2f} | {st['min']:.2f} | {st['max']:.2f} | {st['low']} |\n"
+            )
+        else:
+            md += f"| {ft} | 0 | 0 | -- | -- | -- | -- |\n"
+
+    md += "\n*Adjust the confidence threshold and re-run to improve results.*"
+    return md
+
+
+def _fmt_time(secs: float) -> str:
+    if secs < 60:
+        return f"{secs:.0f}s"
+    m, s = divmod(int(secs), 60)
+    return f"{m}m {s:02d}s"
+
 
 # ---------------------------------------------------------------------------
-# UI callbacks
+# Main pipeline (generator for live updates)
 # ---------------------------------------------------------------------------
 
-
-def on_feature_type_change(feature_type: str):
-    """Update controls when feature type preset changes."""
-    preset = FEATURE_PRESETS[feature_type]
-    custom_visible = feature_type == "Custom"
-    return (
-        preset["prompt"],            # text prompt
-        preset["min_area"],          # min area slider
-        preset["min_compactness"],   # compactness slider
-        preset["min_rectangularity"],  # rectangularity slider
-        gr.update(visible=custom_visible),  # custom prompt visibility
-        gr.update(visible=custom_visible),  # advanced filters visibility
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main pipeline function
-# ---------------------------------------------------------------------------
+PREVIEW_INTERVAL = 20  # update overlay every N tiles
 
 
 def run_pipeline(
     image_file,
     world_file,
     crs: str,
-    feature_type: str,
-    custom_prompt: str,
+    feature_types: list[str],
     confidence: float,
-    min_area: float,
-    min_compactness: float,
-    min_rectangularity: float,
-    progress=gr.Progress(track_tqdm=True),
+    tile_size: int,
 ):
-    """Run the full Janus pipeline end to end."""
+    """Generator: yields (overlay_image, dashboard_md, files) after each tile."""
     if image_file is None:
         raise gr.Error("Please upload an aerial image.")
+    if not feature_types:
+        raise gr.Error("Select at least one feature type.")
 
-    preset = FEATURE_PRESETS[feature_type]
-    text_prompt = custom_prompt if feature_type == "Custom" else preset["prompt"]
+    start_time = time.time()
+    tracker = ConfidenceTracker()
+    all_features: list[dict] = []
+    tmp_dir = tempfile.mkdtemp(prefix="janus_")
 
-    if not text_prompt.strip():
-        raise gr.Error("Please enter a text prompt.")
-
-    color = preset["color"]
-    label = preset["label"] if feature_type != "Custom" else "Features"
-    max_area = preset["max_area"]
-
-    progress(0.05, desc="Ingesting image")
+    # -- Ingest --
+    yield None, "**Ingesting image...**", None
     geotiff = ingest(image_file, world_file, crs)
 
-    progress(0.15, desc="Loading SAM 3 model")
+    # -- Load model --
+    yield None, "**Loading SAM 3 model...** (first run downloads ~1.8 GB)", None
     load_model()
 
-    progress(0.25, desc=f'Segmenting: "{text_prompt}"')
-    mask_path, raw_count = segment(geotiff, text_prompt, confidence)
+    # -- Compute tiles --
+    with rasterio.open(geotiff) as src:
+        img_w, img_h = src.width, src.height
+        crs_obj = src.crs
+        transform = src.transform
 
-    progress(0.65, desc="Vectorizing masks")
-    gdf = vectorize(mask_path)
+    image_name = Path(image_file).name
+    overlap = tile_size // 8
+    windows = compute_tile_windows(img_w, img_h, tile_size, overlap)
+    total_tiles = len(windows)
 
-    progress(0.75, desc="Filtering features")
-    gdf = filter_features(gdf, min_area, max_area, min_compactness, min_rectangularity)
-    filtered_count = len(gdf)
+    dash = format_dashboard(image_name, img_w, img_h, 0, total_tiles, 0, tracker, feature_types, "Starting")
+    yield None, dash, None
 
-    progress(0.85, desc="Exporting files")
-    tmp_dir = os.path.dirname(geotiff)
-    export_paths = export_files(gdf, tmp_dir, label)
+    # -- Process tiles --
+    with rasterio.open(geotiff) as src:
+        for tile_idx, window in enumerate(windows):
+            tile_data = src.read([1, 2, 3], window=window)
+            tile_rgb = np.transpose(tile_data, (1, 2, 0))
+            tile_transform = rasterio.windows.transform(window, transform)
 
-    progress(0.95, desc="Generating overlay")
-    overlay = make_overlay(geotiff, gdf, color, label)
+            for ft in feature_types:
+                preset = FEATURE_PRESETS[ft]
+                masks, scores = segment_tile(tile_rgb, preset["prompt"], confidence)
 
-    # Build summary with confidence stats
-    conf_info = ""
-    if "confidence" in gdf.columns and len(gdf) > 0:
-        conf_info = (
-            f"\n\nConfidence: "
-            f"min {gdf['confidence'].min():.2f} / "
-            f"mean {gdf['confidence'].mean():.2f} / "
-            f"max {gdf['confidence'].max():.2f}"
-        )
+                if len(masks) == 0:
+                    continue
 
-    stats = (
-        f"**{filtered_count}** {label.lower()} extracted "
-        f"({raw_count} raw segments, {raw_count - filtered_count} filtered)\n\n"
-        f"Min area: {min_area} m\u00b2 | CRS: {crs} | Prompt: \"{text_prompt}\""
-        f"{conf_info}"
-    )
+                labeled = np.zeros((tile_rgb.shape[0], tile_rgb.shape[1]), dtype=np.int32)
+                for i, mask in enumerate(masks):
+                    labeled[mask > 0] = i + 1
 
-    return overlay, stats, export_paths
+                for geom, val in shapes(labeled, mask=(labeled > 0), transform=tile_transform):
+                    val = int(val)
+                    score = float(scores[val - 1]) if val - 1 < len(scores) else 0.0
+                    tracker.add(ft, score)
+                    all_features.append({
+                        "geometry": shape(geom),
+                        "feature_type": ft,
+                        "confidence": round(score, 3),
+                    })
+
+            elapsed = time.time() - start_time
+            dash = format_dashboard(
+                image_name, img_w, img_h,
+                tile_idx + 1, total_tiles,
+                elapsed, tracker, feature_types,
+            )
+
+            # Update overlay periodically
+            if (tile_idx + 1) % PREVIEW_INTERVAL == 0 or tile_idx == total_tiles - 1:
+                # Build temp GeoDataFrames for overlay
+                temp_by_type = {}
+                for ft in feature_types:
+                    ft_feats = [f for f in all_features if f["feature_type"] == ft]
+                    if ft_feats:
+                        temp_by_type[ft] = gpd.GeoDataFrame(ft_feats, crs=crs_obj)
+                overlay = make_overlay(geotiff, temp_by_type)
+                yield overlay, dash, None
+            else:
+                yield gr.update(), dash, None
+
+    # -- Deduplicate + filter --
+    elapsed = time.time() - start_time
+    yield gr.update(), format_dashboard(
+        image_name, img_w, img_h, total_tiles, total_tiles,
+        elapsed, tracker, feature_types, "Deduplicating & filtering",
+    ), None
+
+    final_by_type: dict[str, gpd.GeoDataFrame] = {}
+    final_counts: dict[str, int] = {}
+
+    for ft in feature_types:
+        ft_feats = [f for f in all_features if f["feature_type"] == ft]
+        if not ft_feats:
+            final_counts[ft] = 0
+            continue
+        gdf = merge_and_deduplicate(ft_feats, crs_obj)
+        gdf = filter_features(gdf, FEATURE_PRESETS[ft])
+        final_by_type[ft] = gdf
+        final_counts[ft] = len(gdf)
+
+    # -- Export --
+    export_paths = export_all(final_by_type, tmp_dir)
+
+    # -- Final overlay --
+    final_overlay = make_overlay(geotiff, final_by_type)
+
+    elapsed = time.time() - start_time
+    final_dash = format_final_summary(tracker, feature_types, final_counts, elapsed)
+
+    yield final_overlay, final_dash, export_paths
 
 
 # ---------------------------------------------------------------------------
@@ -500,105 +586,59 @@ CUSTOM_CSS = """
     --border-color-primary: #e4e4e7 !important;
 }
 
-* {
-    font-family: 'Outfit', system-ui, -apple-system, sans-serif !important;
-}
+* { font-family: 'Outfit', system-ui, -apple-system, sans-serif !important; }
+code, pre, .code, [class*="mono"] { font-family: 'JetBrains Mono', monospace !important; }
 
-code, pre, .code, [class*="mono"] {
-    font-family: 'JetBrains Mono', monospace !important;
-}
-
-.gradio-container {
-    max-width: 1280px !important;
-    margin: 0 auto !important;
-    background: #fafafa !important;
-}
+.gradio-container { max-width: 1400px !important; margin: 0 auto !important; background: #fafafa !important; }
 
 .gr-button-primary {
-    border-radius: 12px !important;
-    font-weight: 600 !important;
-    letter-spacing: -0.01em !important;
-    padding: 12px 32px !important;
+    border-radius: 12px !important; font-weight: 600 !important;
+    letter-spacing: -0.01em !important; padding: 12px 32px !important;
     transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1) !important;
     box-shadow: 0 1px 3px rgba(0,0,0,0.08) !important;
 }
-
-.gr-button-primary:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important;
-}
-
-.gr-button-primary:active {
-    transform: translateY(0) scale(0.98) !important;
-}
+.gr-button-primary:hover { transform: translateY(-1px) !important; box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important; }
+.gr-button-primary:active { transform: translateY(0) scale(0.98) !important; }
 
 .gr-panel, .gr-box, .gr-form {
-    border-radius: 20px !important;
-    border: 1px solid #e4e4e7 !important;
+    border-radius: 20px !important; border: 1px solid #e4e4e7 !important;
     box-shadow: 0 20px 40px -15px rgba(0,0,0,0.04) !important;
 }
 
 .gr-input, .gr-textbox textarea, select {
-    border-radius: 12px !important;
-    border: 1px solid #e4e4e7 !important;
-    font-size: 14px !important;
-    transition: border-color 0.2s ease !important;
+    border-radius: 12px !important; border: 1px solid #e4e4e7 !important;
+    font-size: 14px !important; transition: border-color 0.2s ease !important;
 }
-
 .gr-input:focus, .gr-textbox textarea:focus {
-    border-color: #18181b !important;
-    box-shadow: 0 0 0 3px rgba(24,24,27,0.06) !important;
+    border-color: #18181b !important; box-shadow: 0 0 0 3px rgba(24,24,27,0.06) !important;
 }
 
-h1 {
-    font-size: 2.25rem !important;
-    font-weight: 700 !important;
-    letter-spacing: -0.03em !important;
-    line-height: 1.1 !important;
-    color: #18181b !important;
-}
-
-h2, h3, .gr-block-label {
-    font-weight: 600 !important;
-    letter-spacing: -0.02em !important;
-    color: #3f3f46 !important;
-}
-
-.markdown-text p {
-    color: #52525b !important;
-    line-height: 1.6 !important;
-    max-width: 65ch !important;
-}
-
+h1 { font-size: 2.25rem !important; font-weight: 700 !important; letter-spacing: -0.03em !important; line-height: 1.1 !important; color: #18181b !important; }
+h2, h3, .gr-block-label { font-weight: 600 !important; letter-spacing: -0.02em !important; color: #3f3f46 !important; }
+.markdown-text p { color: #52525b !important; line-height: 1.6 !important; max-width: 65ch !important; }
 footer { display: none !important; }
-
-.file-preview {
-    border-radius: 16px !important;
-}
 """
 
 HEADER_MD = """
 # Janus
 ### GIS-ready feature extraction from aerial imagery
 
-Upload a high-resolution aerial image with its world file, select a feature type,
-and Janus will detect every instance using SAM 3 \u2014 returning georeferenced vector
-polygons ready for GIS workflows.
+Upload a GeoTIFF (any size), select feature types to extract, and watch SAM 3 process
+tile by tile with live confidence tracking.
 """
 
 gpu_status = (
     f"Running on **{torch.cuda.get_device_name(0)}** "
     f"({torch.cuda.get_device_properties(0).total_memory / (1024**3):.0f} GB)"
     if torch.cuda.is_available()
-    else "No GPU detected \u2014 inference will be slow"
+    else "No GPU detected — inference will be slow"
 )
 
-with gr.Blocks(css=CUSTOM_CSS, title="Janus \u2014 Feature Extraction") as demo:
+with gr.Blocks(css=CUSTOM_CSS, title="Janus — Feature Extraction") as demo:
     gr.Markdown(HEADER_MD)
     gr.Markdown(f"*{gpu_status}*")
 
     with gr.Row(equal_height=False):
-        # Left column: inputs
         with gr.Column(scale=3):
             with gr.Group():
                 image_input = gr.File(
@@ -607,111 +647,43 @@ with gr.Blocks(css=CUSTOM_CSS, title="Janus \u2014 Feature Extraction") as demo:
                     type="filepath",
                 )
                 world_input = gr.File(
-                    label="World File (optional if GeoTIFF)",
+                    label="World File (optional for GeoTIFF)",
                     file_types=[".pgw", ".jgw", ".tfw"],
                     type="filepath",
                 )
 
+            crs_input = gr.Textbox(value="EPSG:4326", label="CRS")
+
+            feature_checks = gr.CheckboxGroup(
+                choices=list(FEATURE_PRESETS.keys()),
+                value=["Building"],
+                label="Feature Types",
+                info="Select one or more feature types to extract",
+            )
+
             with gr.Row():
-                crs_input = gr.Textbox(
-                    value="EPSG:4326",
-                    label="CRS",
-                    info="Coordinate reference system",
-                    scale=1,
+                confidence_slider = gr.Slider(
+                    minimum=0.1, maximum=0.95, value=0.5, step=0.05,
+                    label="Confidence Threshold",
                 )
-                feature_type = gr.Dropdown(
-                    choices=list(FEATURE_PRESETS.keys()),
-                    value="Building",
-                    label="Feature Type",
-                    info="Select a preset or choose Custom",
-                    scale=2,
+                tile_size_dropdown = gr.Dropdown(
+                    choices=[512, 1024, 2048],
+                    value=1024,
+                    label="Tile Size (px)",
+                    info="Larger = fewer tiles but more GPU memory",
                 )
 
-            custom_prompt = gr.Textbox(
-                value="",
-                label="Custom Text Prompt",
-                info="Describe the feature to detect (e.g. 'solar panel', 'swimming pool')",
-                visible=False,
-            )
+            run_btn = gr.Button("Extract Features", variant="primary", size="lg")
 
-            confidence_slider = gr.Slider(
-                minimum=0.1,
-                maximum=0.95,
-                value=0.5,
-                step=0.05,
-                label="Confidence Threshold",
-            )
-
-            with gr.Accordion("Advanced Filters", open=False, visible=True) as adv_filters:
-                min_area_slider = gr.Slider(
-                    minimum=1,
-                    maximum=500,
-                    value=20,
-                    step=5,
-                    label="Min Area (m\u00b2)",
-                )
-                compactness_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=0.8,
-                    value=0.25,
-                    step=0.05,
-                    label="Min Compactness",
-                    info="Higher = more compact shapes only (buildings). Lower = allow elongated shapes (roads).",
-                )
-                rectangularity_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=0.9,
-                    value=0.5,
-                    step=0.05,
-                    label="Min Rectangularity",
-                    info="Higher = more rectangular. Set to 0 for organic shapes (water, roads).",
-                )
-
-            run_btn = gr.Button(
-                "Extract Features",
-                variant="primary",
-                size="lg",
-            )
-
-        # Right column: outputs
-        with gr.Column(scale=4):
-            output_image = gr.Image(
-                label="Result",
-                type="filepath",
-                show_download_button=True,
-            )
-            stats_output = gr.Markdown(label="Summary")
+        with gr.Column(scale=5):
+            dashboard = gr.Markdown(value="*Upload an image and click Extract Features to begin.*")
+            output_image = gr.Image(label="Live Preview", type="filepath", show_download_button=True)
             file_output = gr.Files(label="Download GIS Files")
 
-    # Preset change updates controls
-    feature_type.change(
-        fn=on_feature_type_change,
-        inputs=[feature_type],
-        outputs=[
-            custom_prompt,           # updates value (text prompt)
-            min_area_slider,         # updates value
-            compactness_slider,      # updates value
-            rectangularity_slider,   # updates value
-            custom_prompt,           # updates visibility
-            adv_filters,             # updates visibility (show for custom)
-        ],
-    )
-
-    # Run pipeline
     run_btn.click(
         fn=run_pipeline,
-        inputs=[
-            image_input,
-            world_input,
-            crs_input,
-            feature_type,
-            custom_prompt,
-            confidence_slider,
-            min_area_slider,
-            compactness_slider,
-            rectangularity_slider,
-        ],
-        outputs=[output_image, stats_output, file_output],
+        inputs=[image_input, world_input, crs_input, feature_checks, confidence_slider, tile_size_dropdown],
+        outputs=[output_image, dashboard, file_output],
     )
 
 if __name__ == "__main__":
