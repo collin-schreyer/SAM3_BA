@@ -33,7 +33,13 @@ from shapely.geometry import shape
 # ---------------------------------------------------------------------------
 MODEL = None
 PROCESSOR = None
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def get_device():
+    """Detect GPU at runtime, not import time."""
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 matplotlib.use("Agg")
 
 # ---------------------------------------------------------------------------
@@ -85,8 +91,11 @@ def load_model():
     global MODEL, PROCESSOR
     if MODEL is None:
         from transformers import Sam3Model, Sam3Processor
-        MODEL = Sam3Model.from_pretrained("facebook/sam3").to(DEVICE)
+        device = get_device()
+        print(f"[MODEL] Loading SAM 3 on {device}...")
+        MODEL = Sam3Model.from_pretrained("facebook/sam3").to(device)
         PROCESSOR = Sam3Processor.from_pretrained("facebook/sam3")
+        print(f"[MODEL] SAM 3 loaded on {device}")
     return MODEL, PROCESSOR
 
 # ---------------------------------------------------------------------------
@@ -163,8 +172,9 @@ def compute_tile_windows(img_w: int, img_h: int, tile_size: int, overlap: int) -
 
 def segment_tile(tile_rgb: np.ndarray, prompt: str, confidence: float):
     model, processor = load_model()
+    device = get_device()
     image = Image.fromarray(tile_rgb)
-    inputs = processor(images=image, text=prompt, return_tensors="pt").to(DEVICE)
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
     results = processor.post_process_instance_segmentation(
@@ -627,12 +637,18 @@ Upload a GeoTIFF (any size), select feature types to extract, and watch SAM 3 pr
 tile by tile with live confidence tracking.
 """
 
-gpu_status = (
-    f"Running on **{torch.cuda.get_device_name(0)}** "
-    f"({torch.cuda.get_device_properties(0).total_memory / (1024**3):.0f} GB)"
-    if torch.cuda.is_available()
-    else "No GPU detected — inference will be slow"
-)
+def _gpu_status():
+    try:
+        if torch.cuda.is_available():
+            return (
+                f"Running on **{torch.cuda.get_device_name(0)}** "
+                f"({torch.cuda.get_device_properties(0).total_memory / (1024**3):.0f} GB)"
+            )
+    except Exception:
+        pass
+    return "No GPU detected — inference will be slow"
+
+gpu_status = _gpu_status()
 
 with gr.Blocks(css=CUSTOM_CSS, title="Janus — Feature Extraction") as demo:
     gr.Markdown(HEADER_MD)
