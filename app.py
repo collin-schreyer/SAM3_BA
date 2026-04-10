@@ -597,29 +597,24 @@ def run_pipeline(
             )
 
             # Checkpoint: save downloadable files every N tiles
-            checkpoint_files = None
-            if (tile_idx + 1) % CHECKPOINT_INTERVAL == 0:
+            # Update overlay + save files every PREVIEW_INTERVAL tiles
+            if (tile_idx + 1) % PREVIEW_INTERVAL == 0 or tile_idx == total_tiles - 1 or tile_idx == 0:
                 temp_by_type = {}
                 for ft in feature_types:
                     ft_feats = [f for f in all_features if f["feature_type"] == ft]
                     if ft_feats:
                         temp_by_type[ft] = gpd.GeoDataFrame(ft_feats, crs=crs_obj)
+
+                # Save files every update so they're always downloadable
+                checkpoint_files = None
                 if temp_by_type:
                     checkpoint_files = export_all(temp_by_type, tmp_dir)
-                    dash += f"\n\n*Checkpoint saved at tile {tile_idx + 1} — files available for download below.*"
 
-            # Update overlay periodically
-            if (tile_idx + 1) % PREVIEW_INTERVAL == 0 or tile_idx == total_tiles - 1:
-                temp_by_type = {}
-                for ft in feature_types:
-                    ft_feats = [f for f in all_features if f["feature_type"] == ft]
-                    if ft_feats:
-                        temp_by_type[ft] = gpd.GeoDataFrame(ft_feats, crs=crs_obj)
                 scanned = (scan_left, scan_bottom, scan_right, scan_top)
                 overlay = make_overlay(geotiff, temp_by_type, scanned_bounds=scanned)
                 yield overlay, dash, checkpoint_files
             else:
-                yield gr.update(), dash, checkpoint_files
+                yield gr.update(), dash, gr.update()
 
     # -- Deduplicate + filter --
     elapsed = time.time() - start_time
