@@ -113,6 +113,7 @@ WORLD_EXT_MAP = {
 # Model
 # ---------------------------------------------------------------------------
 
+@spaces.GPU
 def load_model():
     global MODEL, PROCESSOR
     if MODEL is None:
@@ -196,6 +197,7 @@ def compute_tile_windows(img_w: int, img_h: int, tile_size: int, overlap: int) -
 # Per-tile segmentation
 # ---------------------------------------------------------------------------
 
+@spaces.GPU
 def segment_tile(tile_rgb: np.ndarray, prompt: str, confidence: float):
     model, processor = load_model()
     device = get_device()
@@ -508,7 +510,6 @@ def _fmt_time(secs: float) -> str:
 PREVIEW_INTERVAL = 10  # update overlay every N tiles
 
 
-@spaces.GPU(duration=3600)  # request GPU for up to 60 minutes
 def run_pipeline(
     image_file,
     world_file,
