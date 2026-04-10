@@ -667,8 +667,8 @@ with gr.Blocks(css=CUSTOM_CSS, title="Janus — Feature Extraction") as demo:
                     label="Confidence Threshold",
                 )
                 tile_size_dropdown = gr.Dropdown(
-                    choices=[512, 1024, 2048],
-                    value=1024,
+                    choices=[256, 512, 1024, 2048],
+                    value=256,
                     label="Tile Size (px)",
                     info="Larger = fewer tiles but more GPU memory",
                 )
