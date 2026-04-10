@@ -322,11 +322,22 @@ def export_all(features_by_type: dict[str, gpd.GeoDataFrame], tmp_dir: str) -> l
 # Overlay
 # ---------------------------------------------------------------------------
 
-def make_overlay(geotiff: str, features_by_type: dict[str, gpd.GeoDataFrame]) -> str:
+def make_overlay(
+    geotiff: str,
+    features_by_type: dict[str, gpd.GeoDataFrame],
+    scanned_bounds: tuple | None = None,
+) -> str:
+    """Render before/after overlay with optional scan-progress box.
+
+    Args:
+        geotiff: Path to the source GeoTIFF.
+        features_by_type: Dict of feature_type -> GeoDataFrame.
+        scanned_bounds: (left, bottom, right, top) in CRS coordinates showing
+                        the area processed so far. Drawn as a dashed box.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(16, 7), dpi=100)
     fig.patch.set_facecolor("#fafafa")
     with rasterio.open(geotiff) as src:
-        # For large images, read at reduced resolution
         max_dim = 2000
         scale = min(1.0, max_dim / max(src.width, src.height))
         out_w = int(src.width * scale)
@@ -338,11 +349,27 @@ def make_overlay(geotiff: str, features_by_type: dict[str, gpd.GeoDataFrame]) ->
         extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
 
     rgb = np.transpose(data[:3], (1, 2, 0))
+
+    # Left panel: input image
     axes[0].imshow(rgb, extent=extent)
     axes[0].set_title("Input", fontsize=14, fontweight=600, color="#18181b", pad=12)
     axes[0].tick_params(labelsize=7, colors="#71717a")
 
+    # Right panel: image + detected features
     axes[1].imshow(rgb, extent=extent)
+
+    # Draw scan progress box
+    if scanned_bounds is not None:
+        from matplotlib.patches import Rectangle
+        left, bottom, right, top = scanned_bounds
+        rect = Rectangle(
+            (left, bottom), right - left, top - bottom,
+            linewidth=1.5, edgecolor="#71717a", facecolor="none",
+            linestyle="--", alpha=0.6,
+        )
+        axes[1].add_patch(rect)
+
+    # Plot features color-coded by type
     total = 0
     legend_items = []
     for feat_type, gdf in features_by_type.items():
@@ -353,9 +380,9 @@ def make_overlay(geotiff: str, features_by_type: dict[str, gpd.GeoDataFrame]) ->
         total += len(gdf)
         legend_items.append(f"{feat_type}: {len(gdf)}")
 
-    title = f"{total} Features Extracted"
+    title = f"{total} Features"
     if legend_items:
-        title += f" ({', '.join(legend_items)})"
+        title += f"  ({', '.join(legend_items)})"
     axes[1].set_title(title, fontsize=12, fontweight=600, color="#18181b", pad=12)
     axes[1].tick_params(labelsize=7, colors="#71717a")
 
@@ -478,7 +505,7 @@ def _fmt_time(secs: float) -> str:
 # Main pipeline (generator for live updates)
 # ---------------------------------------------------------------------------
 
-PREVIEW_INTERVAL = 20  # update overlay every N tiles
+PREVIEW_INTERVAL = 10  # update overlay every N tiles
 
 
 @spaces.GPU(duration=3600)  # request GPU for up to 60 minutes
@@ -524,11 +551,22 @@ def run_pipeline(
     yield None, dash, None
 
     # -- Process tiles --
+    # Track the scanned region for progress visualization
+    scan_left = scan_bottom = float("inf")
+    scan_right = scan_top = float("-inf")
+
     with rasterio.open(geotiff) as src:
         for tile_idx, window in enumerate(windows):
             tile_data = src.read([1, 2, 3], window=window)
             tile_rgb = np.transpose(tile_data, (1, 2, 0))
             tile_transform = rasterio.windows.transform(window, transform)
+
+            # Update scanned bounds
+            tile_bounds = rasterio.windows.bounds(window, transform)
+            scan_left = min(scan_left, tile_bounds[0])
+            scan_bottom = min(scan_bottom, tile_bounds[1])
+            scan_right = max(scan_right, tile_bounds[2])
+            scan_top = max(scan_top, tile_bounds[3])
 
             for ft in feature_types:
                 preset = FEATURE_PRESETS[ft]
@@ -560,13 +598,13 @@ def run_pipeline(
 
             # Update overlay periodically
             if (tile_idx + 1) % PREVIEW_INTERVAL == 0 or tile_idx == total_tiles - 1:
-                # Build temp GeoDataFrames for overlay
                 temp_by_type = {}
                 for ft in feature_types:
                     ft_feats = [f for f in all_features if f["feature_type"] == ft]
                     if ft_feats:
                         temp_by_type[ft] = gpd.GeoDataFrame(ft_feats, crs=crs_obj)
-                overlay = make_overlay(geotiff, temp_by_type)
+                scanned = (scan_left, scan_bottom, scan_right, scan_top)
+                overlay = make_overlay(geotiff, temp_by_type, scanned_bounds=scanned)
                 yield overlay, dash, None
             else:
                 yield gr.update(), dash, None
