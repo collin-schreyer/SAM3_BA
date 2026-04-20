@@ -72,29 +72,17 @@ matplotlib.use("Agg")
 # Feature presets
 # ---------------------------------------------------------------------------
 FEATURE_PRESETS = {
-    "Building (Roof)": {
-        "prompt": "roof",
+    "Building": {
+        "prompt": "building",
         "min_area": 20.0, "max_area": 50000.0,
         "min_compactness": 0.25, "min_rectangularity": 0.5,
         "color": "#10b981",
     },
-    "Building (Original)": {
-        "prompt": "building",
-        "min_area": 20.0, "max_area": 50000.0,
-        "min_compactness": 0.25, "min_rectangularity": 0.5,
-        "color": "#059669",
-    },
-    "Building (Rooftop)": {
+    "Rooftop": {
         "prompt": "rooftop",
         "min_area": 20.0, "max_area": 50000.0,
         "min_compactness": 0.25, "min_rectangularity": 0.5,
         "color": "#34d399",
-    },
-    "Building (Structure)": {
-        "prompt": "structure",
-        "min_area": 20.0, "max_area": 50000.0,
-        "min_compactness": 0.25, "min_rectangularity": 0.5,
-        "color": "#047857",
     },
     "Road": {
         "prompt": "road",
@@ -762,7 +750,7 @@ with gr.Blocks(css=CUSTOM_CSS, title="Janus — Feature Extraction") as demo:
 
             feature_checks = gr.CheckboxGroup(
                 choices=list(FEATURE_PRESETS.keys()),
-                value=["Building (Roof)"],
+                value=["Building"],
                 label="Feature Types",
                 info="Select one or more feature types to extract",
             )
