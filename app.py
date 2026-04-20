@@ -708,7 +708,7 @@ footer { display: none !important; }
 """
 
 HEADER_MD = """
-# Janus
+# Janus [Auto-Synced]
 ### GIS-ready feature extraction from aerial imagery
 
 Upload a GeoTIFF (any size), select feature types to extract, and watch SAM 3 process
