@@ -14,8 +14,8 @@ def test_building_detection(image_path: str, prompt: str):
         print(f"Error: Could not find test image at {image_path}")
         return
 
-    print(f"Connecting to Hugging Face Space 'collzibip/SAM3_BA'...")
-    client = Client("collzibip/SAM3_BA", hf_token=HF_TOKEN)
+    print(f"Connecting to Hugging Face Space 'el-best007/SAM3_BA'...")
+    client = Client("el-best007/SAM3_BA", hf_token=HF_TOKEN)
     
     print(f"[*] Sending '{image_path}' to the agent with feature preset: {prompt}")
     
