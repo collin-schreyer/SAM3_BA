@@ -24,5 +24,5 @@ jobs:
           git config --global user.name "GitHub Actions"
           
           # Force push to the active Hugging Face Space.
-          git remote add space https://collzibip:$HF_TOKEN@huggingface.co/spaces/collzibip/SAM3_BA
+          git remote add space https://el-best007:$HF_TOKEN@huggingface.co/spaces/collzibip/SAM3_BA
           git push --force space main
