@@ -1,0 +1,28 @@
+name: Sync to Hugging Face Hub
+
+on:
+  push:
+    branches: [main]
+  
+  # Controls when the action will run. Workflow runs when manually triggered using the UI or API.
+  workflow_dispatch:
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true
+      
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+          
+          # Force push to the active Hugging Face Space.
+          git remote add space https://collzibip:$HF_TOKEN@huggingface.co/spaces/collzibip/SAM3_BA
+          git push --force space main
